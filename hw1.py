@@ -14,18 +14,18 @@ stop_list = ['the', 'a', 'an', 'another', "for", "an", "nor", "but", "or", "yet"
              "in", "under", "towards", "before"]
 
 # TODO move to args?
+# TODO set all seeds
 # Initial params
 limit = 50  # Use -1 for no limit
 data = "barcelona"  # Use "barcelona" or "titles"
 nearest = 5
 
 # TODO what is the hyperparameters?
-features = "tfidf"  # Use "tfidf" or "word2vec"
+type_features = "tfidf"  # Use "tfidf" or "word_to_vec"
 use_stopwords = True  # Use True or False
 use_custom_stopwords = False  # Use True or False
 latent_features = 20  # Dimension of features
 numHashTables = 3
-
 
 
 def timeit(func):
@@ -56,7 +56,7 @@ def limit_data(df):
     return df
 
 
-def get_features(df, input_col="name", output_col="features"):
+def get_features(df, input_col="name", output_col="features", type_features=type_features):
     tokenizer = Tokenizer(inputCol=input_col, outputCol="words")
     df = tokenizer.transform(df)
 
@@ -69,30 +69,30 @@ def get_features(df, input_col="name", output_col="features"):
         df = df.drop("words")
         df = df.withColumnRenamed("clean_tokens", "words")
 
-    if features == "tfidf":
+    if type_features == "tfidf":
         hashing = HashingTF(inputCol="words", outputCol="hash", numFeatures=latent_features)
         df = hashing.transform(df)
 
         idf = IDF(inputCol="hash", outputCol=output_col)
         model = idf.fit(df)
         df = model.transform(df)
-    elif features == "word2vec":
+    elif type_features == "word_to_vec":
         word_vec = Word2Vec(vectorSize=latent_features, minCount=0, inputCol="words", outputCol=output_col)
         model = word_vec.fit(df)
         df = model.transform(df)
     else:
-        raise ValueError("Invalid feature " + features)
+        raise ValueError("Invalid feature " + type_features)
 
     return df
 
 
 @timeit
-def compute_gt(ds, k=nearest, input_col="features", output_col="gt_neighbors"):
+def compute_gt(ds, spark, k=nearest, input_col="features", output_col="gt_neighbors"):
     # TODO make it fully on spark
     df = ds.toPandas()
     features = df[input_col].tolist()
-    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='ball_tree').fit(features)
-    distances, indices = nbrs.kneighbors(features)
+    model = NearestNeighbors(n_neighbors=k + 1, algorithm='ball_tree').fit(features)
+    distances, indices = model.kneighbors(features)
     # remove self from neighbors TODO something better and faster?
     indices = [Vectors.dense(df["id"][np.delete(ind, np.where(ind == i))].values) for i, ind in enumerate(indices)]
     df[output_col] = indices
@@ -100,30 +100,30 @@ def compute_gt(ds, k=nearest, input_col="features", output_col="gt_neighbors"):
     return spark.createDataFrame(df)
 
 
-
 @timeit
-def lsh_prediction(ds, k=nearest, input_col="features", output_col="ann_neighbors", num_hash_tables=numHashTables):
+def lsh_prediction(ds, spark, k=nearest, input_col="features",
+                   output_col="ann_neighbors", num_hash_tables=numHashTables):
     model = MinHashLSH(inputCol=input_col, outputCol=output_col, numHashTables=num_hash_tables)
     model = model.fit(ds)
 
-    # ds = model.transform(ds) # TODO what is this for?
-
-    anns = []
+    # TODO There should be something better than this
+    pred = []
     for i in tqdm(ds.collect()):
         id_ = i["id"]
         key = i[input_col]
 
-        anns.append(model.approxNearestNeighbors(ds, key, k+1).filter(col("id") != id_).select("id").collect())
+        pred.append(model.approxNearestNeighbors(ds, key, k + 1).filter(col("id") != id_).select("id").collect())
 
-    anns = [Vectors.dense([i["id"] for i in ann]) for ann in anns]
+    pred = [Vectors.dense([i["id"] for i in ann]) for ann in pred]
     df = ds.toPandas()
-    df[output_col] = anns
+    df[output_col] = pred
     ds = spark.createDataFrame(df)
-
 
     return ds
 
-def eval(ds):
+
+def evaluation(ds):
+    # TODO There should be something better than this
     acc = 0
     for i in tqdm(ds.collect()):
         gt = i["gt_neighbors"]
@@ -137,21 +137,22 @@ def eval(ds):
 
 if __name__ == '__main__':
     sc = pyspark.SparkContext('local[*]')
-    spark = SparkSession(sc)
+    sc = SparkSession(sc)
 
-    print(spark)
+    print(sc)
 
-    print("Reading data for " + data + " with limit " + str(limit) + " and features " + features)
-    data = read_data(spark)
+    print("Reading data for " + data + " with limit " + str(limit) + " and features " + type_features)
+    data = read_data(sc)
     data = limit_data(data)
 
     data = get_features(data)
 
     print("Calculating gt neighbors nearest neighbors, could take a while...")
-    data = compute_gt(data)
+    data = compute_gt(data, sc)
     print(data.select("gt_neighbors").show(5))
 
     print("Calculating lsh neighbors nearest neighbors, could take a while...")
-    data = lsh_prediction(data)
+    data = lsh_prediction(data, sc)
 
-    print("Accuracy: " + str(eval(data)))
+    # TODO val split?
+    print("Accuracy: " + str(evaluation(data)))
