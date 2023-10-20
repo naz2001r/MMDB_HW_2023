@@ -1,12 +1,13 @@
 import pyspark
-from pyspark import Row
+from tqdm import tqdm
 from pyspark.ml.linalg import Vectors
 from pyspark.sql import SparkSession
-from pyspark.ml.feature import HashingTF, IDF, Tokenizer, StopWordsRemover
+from pyspark.ml.feature import HashingTF, IDF, Tokenizer, StopWordsRemover, MinHashLSH
 from pyspark.ml.feature import Word2Vec
 import findspark
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
+from pyspark.sql.functions import col
 
 findspark.init()
 stop_list = ['the', 'a', 'an', 'another', "for", "an", "nor", "but", "or", "yet", "so",
@@ -14,15 +15,16 @@ stop_list = ['the', 'a', 'an', 'another', "for", "an", "nor", "but", "or", "yet"
 
 # TODO move to args?
 # Initial params
-limit = 500  # Use -1 for no limit
+limit = 50  # Use -1 for no limit
 data = "barcelona"  # Use "barcelona" or "titles"
 nearest = 5
 
-# TODO Is the next hyperparameters?
+# TODO what is the hyperparameters?
 features = "tfidf"  # Use "tfidf" or "word2vec"
 use_stopwords = True  # Use True or False
 use_custom_stopwords = False  # Use True or False
 latent_features = 20  # Dimension of features
+numHashTables = 3
 
 
 
@@ -92,10 +94,45 @@ def compute_gt(ds, k=nearest, input_col="features", output_col="gt_neighbors"):
     nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='ball_tree').fit(features)
     distances, indices = nbrs.kneighbors(features)
     # remove self from neighbors TODO something better and faster?
-    indices = [Vectors.dense(np.delete(ind, np.where(ind == i))) for i, ind in enumerate(indices)]
+    indices = [Vectors.dense(df["id"][np.delete(ind, np.where(ind == i))].values) for i, ind in enumerate(indices)]
     df[output_col] = indices
 
     return spark.createDataFrame(df)
+
+
+
+@timeit
+def lsh_prediction(ds, k=nearest, input_col="features", output_col="ann_neighbors", num_hash_tables=numHashTables):
+    model = MinHashLSH(inputCol=input_col, outputCol=output_col, numHashTables=num_hash_tables)
+    model = model.fit(ds)
+
+    # ds = model.transform(ds) # TODO what is this for?
+
+    anns = []
+    for i in tqdm(ds.collect()):
+        id_ = i["id"]
+        key = i[input_col]
+
+        anns.append(model.approxNearestNeighbors(ds, key, k+1).filter(col("id") != id_).select("id").collect())
+
+    anns = [Vectors.dense([i["id"] for i in ann]) for ann in anns]
+    df = ds.toPandas()
+    df[output_col] = anns
+    ds = spark.createDataFrame(df)
+
+
+    return ds
+
+def eval(ds):
+    acc = 0
+    for i in tqdm(ds.collect()):
+        gt = i["gt_neighbors"]
+        ann = i["ann_neighbors"]
+        gt.sort(), ann.sort()
+        acc += len(set(gt).intersection(set(ann)))
+    acc /= len(ds.collect()) * nearest
+
+    return acc
 
 
 if __name__ == '__main__':
@@ -113,3 +150,8 @@ if __name__ == '__main__':
     print("Calculating gt neighbors nearest neighbors, could take a while...")
     data = compute_gt(data)
     print(data.select("gt_neighbors").show(5))
+
+    print("Calculating lsh neighbors nearest neighbors, could take a while...")
+    data = lsh_prediction(data)
+
+    print("Accuracy: " + str(eval(data)))
